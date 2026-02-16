@@ -21,6 +21,12 @@ const PTR_MASK: u64 = ~@as(u64, 0xF);
 const NONE: Term = 0;
 const NIL: Term = TAG_NIL;
 
+// Boxed type discriminants (stored in word[0] of heap-allocated boxed values)
+const BOXED_FLOAT: Term = 0;
+const BOXED_BINARY: Term = 1;
+const BOXED_FUN: Term = 2;
+const BOXED_MAP: Term = 3;
+
 fn mk_int(v: i64) Term {
     return (@as(u64, @bitCast(v)) << 4) | TAG_INT;
 }
@@ -55,6 +61,58 @@ fn as_ptr(t: Term) [*]Term {
 
 fn tag_of(t: Term) u4 {
     return @truncate(t & TAG_MASK);
+}
+
+fn mk_float(proc: *Process, val: f64) Term {
+    const ptr = proc.heap_alloc(3);
+    ptr[0] = BOXED_FLOAT;
+    const bits: u64 = @bitCast(val);
+    ptr[1] = bits >> 32; // hi32
+    ptr[2] = bits & 0xFFFFFFFF; // lo32
+    return mk_ptr(TAG_BOXED, ptr);
+}
+
+fn as_float(term: Term) f64 {
+    const ptr = as_ptr(term);
+    // ptr[0] == BOXED_FLOAT
+    const bits: u64 = (ptr[1] << 32) | ptr[2];
+    return @bitCast(bits);
+}
+
+fn is_boxed_float(term: Term) bool {
+    return tag_of(term) == TAG_BOXED and as_ptr(term)[0] == BOXED_FLOAT;
+}
+
+fn mk_binary(proc: *Process, bytes: []const u8) Term {
+    const len = bytes.len;
+    const words_needed: u32 = @intCast(2 + (len + 7) / 8);
+    const ptr = proc.heap_alloc(words_needed);
+    ptr[0] = BOXED_BINARY;
+    ptr[1] = @intCast(len);
+    // Pack bytes into Term-sized words (8 bytes each)
+    const dest: [*]u8 = @ptrCast(&ptr[2]);
+    @memcpy(dest[0..len], bytes);
+    return mk_ptr(TAG_BOXED, ptr);
+}
+
+fn as_binary_slice(term: Term) []const u8 {
+    const ptr = as_ptr(term);
+    // ptr[0] == BOXED_BINARY
+    const len: usize = @intCast(ptr[1]);
+    const src: [*]const u8 = @ptrCast(&ptr[2]);
+    return src[0..len];
+}
+
+fn is_boxed_binary(term: Term) bool {
+    return tag_of(term) == TAG_BOXED and as_ptr(term)[0] == BOXED_BINARY;
+}
+
+fn is_boxed_fun(term: Term) bool {
+    return tag_of(term) == TAG_BOXED and as_ptr(term)[0] == BOXED_FUN;
+}
+
+fn is_boxed_map(term: Term) bool {
+    return tag_of(term) == TAG_BOXED and as_ptr(term)[0] == BOXED_MAP;
 }
 
 fn is_cp(v: u64) bool {
@@ -114,6 +172,10 @@ const Process = struct {
     status: ProcStatus = .free,
     mbox: std.array_list.Managed(Term),
     save: u32 = 0,
+    // Process dictionary
+    pdict_keys: [64]Term = [_]Term{NONE} ** 64,
+    pdict_vals: [64]Term = [_]Term{NONE} ** 64,
+    pdict_count: u32 = 0,
 
     fn y_reg(self: *Process, idx: u32) *Term {
         return &self.stack[self.sp + idx];
@@ -164,6 +226,12 @@ const VM = struct {
     atom_badarith: u32 = 0,
     atom_erlang: u32 = 0,
     atom_module_info: u32 = 0,
+    atom_nonode_at_nohost: u32 = 0,
+    atom_normal: u32 = 0,
+    // Named process registry
+    reg_names: [256]u32 = [_]u32{0} ** 256,
+    reg_pids: [256]u32 = [_]u32{0} ** 256,
+    reg_count: u32 = 0,
 };
 
 // ============================================================================
@@ -199,6 +267,8 @@ fn pre_register_atoms(vm: *VM) void {
     vm.atom_badarith = put_atom(vm, "badarith");
     vm.atom_erlang = put_atom(vm, "erlang");
     vm.atom_module_info = put_atom(vm, "module_info");
+    vm.atom_nonode_at_nohost = put_atom(vm, "nonode@nohost");
+    vm.atom_normal = put_atom(vm, "normal");
 }
 
 // ============================================================================
@@ -655,14 +725,26 @@ fn decode_etf_term(vm: *VM, data: []const u8, pos: *usize, proc: ?*Process) Term
             return tail;
         },
         70 => { // new_float_ext
-            pos.* += 8; // Skip 8-byte IEEE float for now
-            return mk_int(0); // TODO: boxed float
+            const bits = std.mem.readInt(u64, data[pos.*..][0..8], .big);
+            pos.* += 8;
+            const val: f64 = @bitCast(bits);
+            if (proc) |p| {
+                return mk_float(p, val);
+            } else {
+                // No process context — return as integer (lossy)
+                return mk_int(@intFromFloat(val));
+            }
         },
         109 => { // binary_ext
             const len: u32 = std.mem.readInt(u32, data[pos.*..][0..4], .big);
             pos.* += 4;
-            pos.* += len; // Skip binary data for now
-            return NIL; // TODO: boxed binary
+            const bytes = data[pos.* .. pos.* + len];
+            pos.* += len;
+            if (proc) |p| {
+                return mk_binary(p, bytes);
+            } else {
+                return NIL;
+            }
         },
         110 => { // small_big_ext
             const n: u8 = data[pos.*];
@@ -675,6 +757,26 @@ fn decode_etf_term(vm: *VM, data: []const u8, pos: *usize, proc: ?*Process) Term
             pos.* += 4;
             pos.* += 1 + n; // sign + digits
             return mk_int(0); // TODO
+        },
+        116 => { // map_ext
+            const arity: u32 = std.mem.readInt(u32, data[pos.*..][0..4], .big);
+            pos.* += 4;
+            if (proc) |p| {
+                const mem = p.heap_alloc(2 + arity * 2);
+                mem[0] = BOXED_MAP;
+                mem[1] = @intCast(arity);
+                for (0..arity) |i| {
+                    mem[2 + i * 2] = decode_etf_term(vm, data, pos, proc); // key
+                    mem[2 + i * 2 + 1] = decode_etf_term(vm, data, pos, proc); // value
+                }
+                return mk_ptr(TAG_BOXED, mem);
+            } else {
+                // Skip all key-value pairs
+                for (0..arity * 2) |_| {
+                    _ = decode_etf_term(vm, data, pos, proc);
+                }
+                return NIL;
+            }
         },
         else => {
             return NIL;
@@ -751,9 +853,14 @@ const op_arity_table: [256]u8 = blk: {
     t[124] = 5; // gc_bif1
     t[125] = 6; // gc_bif2
     t[126] = 2; // is_boolean
-    t[136] = 1; // trim
+    t[136] = 2; // trim N Remaining
     t[152] = 7; // gc_bif3
     t[153] = 1; // line
+    t[154] = 5; // put_map_assoc Fail Src Dst Live Pairs(ext_list)
+    t[155] = 5; // put_map_exact Fail Src Dst Live Pairs(ext_list)
+    t[156] = 2; // is_map Fail Src
+    t[157] = 3; // has_map_fields Fail Src Fields(ext_list)
+    t[158] = 3; // get_map_elements Fail Src Pairs(ext_list)
     t[159] = 4; // is_tagged_tuple
     t[162] = 2; // get_hd
     t[163] = 2; // get_tl
@@ -763,6 +870,7 @@ const op_arity_table: [256]u8 = blk: {
     t[172] = 1; // init_yregs (arg is ext_list)
     t[178] = 3; // call_fun2
     t[183] = 2; // executable_line
+    t[184] = 2; // debug_line
     break :blk t;
 };
 
@@ -869,6 +977,44 @@ fn do_deep_copy(proc: *Process, term: Term) Term {
             }
             return mk_ptr(TAG_TUPLE, mem);
         },
+        TAG_BOXED => {
+            const ptr = as_ptr(term);
+            if (ptr[0] == BOXED_FLOAT) {
+                const mem = proc.heap_alloc(3);
+                mem[0] = ptr[0];
+                mem[1] = ptr[1];
+                mem[2] = ptr[2];
+                return mk_ptr(TAG_BOXED, mem);
+            } else if (ptr[0] == BOXED_BINARY) {
+                const len: usize = @intCast(ptr[1]);
+                const words: u32 = @intCast(2 + (len + 7) / 8);
+                const mem = proc.heap_alloc(words);
+                for (0..words) |i| {
+                    mem[i] = ptr[i];
+                }
+                return mk_ptr(TAG_BOXED, mem);
+            } else if (ptr[0] == BOXED_MAP) {
+                const size: u32 = @intCast(ptr[1]);
+                const words: u32 = 2 + size * 2;
+                const mem = proc.heap_alloc(words);
+                mem[0] = ptr[0];
+                mem[1] = ptr[1];
+                for (0..size) |i| {
+                    mem[2 + i * 2] = do_deep_copy(proc, ptr[2 + i * 2]);
+                    mem[2 + i * 2 + 1] = do_deep_copy(proc, ptr[2 + i * 2 + 1]);
+                }
+                return mk_ptr(TAG_BOXED, mem);
+            } else if (ptr[0] == BOXED_FUN) {
+                const nfree: u32 = @intCast(as_int(ptr[4]));
+                const words: u32 = 5 + nfree;
+                const mem = proc.heap_alloc(words);
+                for (0..words) |i| {
+                    mem[i] = ptr[i];
+                }
+                return mk_ptr(TAG_BOXED, mem);
+            }
+            return term;
+        },
         else => return term,
     }
 }
@@ -900,6 +1046,7 @@ fn resolve_bif(vm: *VM, imp: Import) ?BifFn {
         if (std.mem.eql(u8, fun_name, "+") and imp.arity == 2) return &bif_add;
         if (std.mem.eql(u8, fun_name, "-") and imp.arity == 2) return &bif_sub;
         if (std.mem.eql(u8, fun_name, "*") and imp.arity == 2) return &bif_mul;
+        if (std.mem.eql(u8, fun_name, "/") and imp.arity == 2) return &bif_fdiv;
         if (std.mem.eql(u8, fun_name, "div") and imp.arity == 2) return &bif_div;
         if (std.mem.eql(u8, fun_name, "rem") and imp.arity == 2) return &bif_rem;
         if (std.mem.eql(u8, fun_name, "=:=") and imp.arity == 2) return &bif_eq_exact;
@@ -923,13 +1070,95 @@ fn resolve_bif(vm: *VM, imp: Import) ?BifFn {
         if (std.mem.eql(u8, fun_name, "abs") and imp.arity == 1) return &bif_abs;
         if (std.mem.eql(u8, fun_name, "get_module_info") and (imp.arity == 1 or imp.arity == 2)) return &bif_module_info;
         if (std.mem.eql(u8, fun_name, "error") and imp.arity == 1) return &bif_error;
+        if (std.mem.eql(u8, fun_name, "error") and imp.arity == 2) return &bif_error;
         if (std.mem.eql(u8, fun_name, "throw") and imp.arity == 1) return &bif_throw;
+        // Conversion BIFs
+        if (std.mem.eql(u8, fun_name, "atom_to_list") and imp.arity == 1) return &bif_atom_to_list;
+        if (std.mem.eql(u8, fun_name, "list_to_atom") and imp.arity == 1) return &bif_list_to_atom;
+        if (std.mem.eql(u8, fun_name, "integer_to_list") and imp.arity == 1) return &bif_integer_to_list;
+        if (std.mem.eql(u8, fun_name, "list_to_integer") and imp.arity == 1) return &bif_list_to_integer;
+        if (std.mem.eql(u8, fun_name, "list_to_tuple") and imp.arity == 1) return &bif_list_to_tuple;
+        if (std.mem.eql(u8, fun_name, "tuple_to_list") and imp.arity == 1) return &bif_tuple_to_list;
+        if (std.mem.eql(u8, fun_name, "float_to_list") and imp.arity == 1) return &bif_float_to_list;
+        if (std.mem.eql(u8, fun_name, "integer_to_binary") and imp.arity == 1) return &bif_integer_to_binary;
+        if (std.mem.eql(u8, fun_name, "atom_to_binary") and imp.arity == 1) return &bif_atom_to_binary;
+        // Arithmetic
+        if (std.mem.eql(u8, fun_name, "max") and imp.arity == 2) return &bif_max;
+        if (std.mem.eql(u8, fun_name, "min") and imp.arity == 2) return &bif_min;
+        if (std.mem.eql(u8, fun_name, "not") and imp.arity == 1) return &bif_not;
+        if (std.mem.eql(u8, fun_name, "and") and imp.arity == 2) return &bif_and;
+        if (std.mem.eql(u8, fun_name, "or") and imp.arity == 2) return &bif_or;
+        if (std.mem.eql(u8, fun_name, "band") and imp.arity == 2) return &bif_band;
+        if (std.mem.eql(u8, fun_name, "bor") and imp.arity == 2) return &bif_bor;
+        if (std.mem.eql(u8, fun_name, "bxor") and imp.arity == 2) return &bif_bxor;
+        if (std.mem.eql(u8, fun_name, "bnot") and imp.arity == 1) return &bif_bnot;
+        if (std.mem.eql(u8, fun_name, "bsl") and imp.arity == 2) return &bif_bsl;
+        if (std.mem.eql(u8, fun_name, "bsr") and imp.arity == 2) return &bif_bsr;
+        if (std.mem.eql(u8, fun_name, "negate") and imp.arity == 1) return &bif_negate;
+        // List operations
+        if (std.mem.eql(u8, fun_name, "++") and imp.arity == 2) return &bif_append;
+        if (std.mem.eql(u8, fun_name, "--") and imp.arity == 2) return &bif_subtract;
+        // Type checks
+        if (std.mem.eql(u8, fun_name, "is_float") and imp.arity == 1) return &bif_is_float;
+        if (std.mem.eql(u8, fun_name, "is_binary") and imp.arity == 1) return &bif_is_binary_bif;
+        if (std.mem.eql(u8, fun_name, "is_number") and imp.arity == 1) return &bif_is_number;
+        if (std.mem.eql(u8, fun_name, "is_pid") and imp.arity == 1) return &bif_is_pid;
+        if (std.mem.eql(u8, fun_name, "is_function") and imp.arity == 1) return &bif_is_function;
+        if (std.mem.eql(u8, fun_name, "is_map") and imp.arity == 1) return &bif_is_map;
+        if (std.mem.eql(u8, fun_name, "map_size") and imp.arity == 1) return &bif_map_size;
+        if (std.mem.eql(u8, fun_name, "byte_size") and imp.arity == 1) return &bif_byte_size;
+        if (std.mem.eql(u8, fun_name, "bit_size") and imp.arity == 1) return &bif_bit_size;
+        if (std.mem.eql(u8, fun_name, "map_get") and imp.arity == 2) return &bif_map_get;
+        if (std.mem.eql(u8, fun_name, "is_map_key") and imp.arity == 2) return &bif_is_map_key;
+        if (std.mem.eql(u8, fun_name, "setelement") and imp.arity == 3) return &bif_setelement;
+        // Info
+        if (std.mem.eql(u8, fun_name, "node") and imp.arity == 0) return &bif_node;
+        if (std.mem.eql(u8, fun_name, "put") and imp.arity == 2) return &bif_put;
+        if (std.mem.eql(u8, fun_name, "get") and imp.arity == 1) return &bif_get;
+        if (std.mem.eql(u8, fun_name, "process_flag") and imp.arity == 2) return &bif_process_flag;
+        if (std.mem.eql(u8, fun_name, "register") and imp.arity == 2) return &bif_register;
+        if (std.mem.eql(u8, fun_name, "whereis") and imp.arity == 1) return &bif_whereis;
+        if (std.mem.eql(u8, fun_name, "monitor") and imp.arity == 2) return &bif_monitor_stub;
+        if (std.mem.eql(u8, fun_name, "demonitor") and (imp.arity == 1 or imp.arity == 2)) return &bif_demonitor_stub;
+        if (std.mem.eql(u8, fun_name, "link") and imp.arity == 1) return &bif_link_stub;
+        if (std.mem.eql(u8, fun_name, "unlink") and imp.arity == 1) return &bif_unlink_stub;
+        if (std.mem.eql(u8, fun_name, "exit") and imp.arity == 2) return &bif_exit_stub;
+        if (std.mem.eql(u8, fun_name, "apply") and imp.arity == 3) return &bif_apply;
     }
     if (std.mem.eql(u8, mod_name, "init")) {
         if (std.mem.eql(u8, fun_name, "stop") and imp.arity == 0) return &bif_halt;
     }
     if (std.mem.eql(u8, mod_name, "io")) {
         if (std.mem.eql(u8, fun_name, "format") and (imp.arity == 1 or imp.arity == 2)) return &bif_io_format;
+    }
+    if (std.mem.eql(u8, mod_name, "lists")) {
+        if (std.mem.eql(u8, fun_name, "reverse") and imp.arity == 1) return &bif_lists_reverse;
+        if (std.mem.eql(u8, fun_name, "reverse") and imp.arity == 2) return &bif_lists_reverse2;
+        if (std.mem.eql(u8, fun_name, "member") and imp.arity == 2) return &bif_lists_member;
+        if (std.mem.eql(u8, fun_name, "keyfind") and imp.arity == 3) return &bif_lists_keyfind;
+        if (std.mem.eql(u8, fun_name, "keymember") and imp.arity == 3) return &bif_lists_keymember;
+        if (std.mem.eql(u8, fun_name, "keysearch") and imp.arity == 3) return &bif_lists_keysearch;
+    }
+    if (std.mem.eql(u8, mod_name, "maps")) {
+        if (std.mem.eql(u8, fun_name, "get") and imp.arity == 2) return &bif_maps_get;
+        if (std.mem.eql(u8, fun_name, "put") and imp.arity == 3) return &bif_maps_put;
+        if (std.mem.eql(u8, fun_name, "is_key") and imp.arity == 2) return &bif_maps_is_key;
+        if (std.mem.eql(u8, fun_name, "keys") and imp.arity == 1) return &bif_maps_keys;
+        if (std.mem.eql(u8, fun_name, "values") and imp.arity == 1) return &bif_maps_values;
+        if (std.mem.eql(u8, fun_name, "size") and imp.arity == 1) return &bif_maps_size;
+        if (std.mem.eql(u8, fun_name, "to_list") and imp.arity == 1) return &bif_maps_to_list;
+        if (std.mem.eql(u8, fun_name, "from_list") and imp.arity == 1) return &bif_maps_from_list;
+        if (std.mem.eql(u8, fun_name, "find") and imp.arity == 2) return &bif_maps_find;
+        if (std.mem.eql(u8, fun_name, "remove") and imp.arity == 2) return &bif_maps_remove;
+        if (std.mem.eql(u8, fun_name, "merge") and imp.arity == 2) return &bif_maps_merge;
+        if (std.mem.eql(u8, fun_name, "update") and imp.arity == 3) return &bif_maps_put;
+    }
+    if (std.mem.eql(u8, mod_name, "math")) {
+        if (std.mem.eql(u8, fun_name, "sqrt") and imp.arity == 1) return &bif_math_sqrt;
+    }
+    if (std.mem.eql(u8, mod_name, "string") or std.mem.eql(u8, mod_name, "unicode")) {
+        // Stubs for common string/unicode functions
+        if (std.mem.eql(u8, fun_name, "characters_to_list") and (imp.arity == 1 or imp.arity == 2)) return &bif_characters_to_list;
     }
     return null;
 }
@@ -1035,15 +1264,37 @@ fn bif_halt(_: *VM, _: *Process, _: []Term) Term {
     std.process.exit(0);
 }
 
-fn bif_add(vm: *VM, _: *Process, args: []Term) Term {
+fn as_number_f64(t: Term) f64 {
+    if (tag_of(t) == TAG_INT) return @floatFromInt(as_int(t));
+    if (is_boxed_float(t)) return as_float(t);
+    return 0.0;
+}
+
+fn is_number(t: Term) bool {
+    return tag_of(t) == TAG_INT or is_boxed_float(t);
+}
+
+fn bif_add(vm: *VM, proc: *Process, args: []Term) Term {
+    if (is_boxed_float(args[0]) or is_boxed_float(args[1])) {
+        _ = vm;
+        return mk_float(proc, as_number_f64(args[0]) + as_number_f64(args[1]));
+    }
     _ = vm;
     return mk_int(as_int(args[0]) + as_int(args[1]));
 }
-fn bif_sub(vm: *VM, _: *Process, args: []Term) Term {
+fn bif_sub(vm: *VM, proc: *Process, args: []Term) Term {
+    if (is_boxed_float(args[0]) or is_boxed_float(args[1])) {
+        _ = vm;
+        return mk_float(proc, as_number_f64(args[0]) - as_number_f64(args[1]));
+    }
     _ = vm;
     return mk_int(as_int(args[0]) - as_int(args[1]));
 }
-fn bif_mul(vm: *VM, _: *Process, args: []Term) Term {
+fn bif_mul(vm: *VM, proc: *Process, args: []Term) Term {
+    if (is_boxed_float(args[0]) or is_boxed_float(args[1])) {
+        _ = vm;
+        return mk_float(proc, as_number_f64(args[0]) * as_number_f64(args[1]));
+    }
     _ = vm;
     return mk_int(as_int(args[0]) * as_int(args[1]));
 }
@@ -1055,7 +1306,15 @@ fn bif_rem(vm: *VM, _: *Process, args: []Term) Term {
     _ = vm;
     return mk_int(@rem(as_int(args[0]), as_int(args[1])));
 }
-fn bif_abs(vm: *VM, _: *Process, args: []Term) Term {
+fn bif_fdiv(_: *VM, proc: *Process, args: []Term) Term {
+    return mk_float(proc, as_number_f64(args[0]) / as_number_f64(args[1]));
+}
+fn bif_abs(vm: *VM, proc: *Process, args: []Term) Term {
+    if (is_boxed_float(args[0])) {
+        _ = vm;
+        const v = as_float(args[0]);
+        return mk_float(proc, @abs(v));
+    }
     _ = vm;
     const v = as_int(args[0]);
     return mk_int(if (v < 0) -v else v);
@@ -1165,11 +1424,843 @@ fn bif_io_format(vm: *VM, proc: *Process, args: []Term) Term {
     return mk_atom(vm.atom_ok);
 }
 
+// ============================================================================
+// Section 9b: Additional BIF Implementations
+// ============================================================================
+
+fn bif_atom_to_list(vm: *VM, proc: *Process, args: []Term) Term {
+    if (tag_of(args[0]) != TAG_ATOM) return mk_atom(vm.atom_badarg);
+    const idx = as_atom(args[0]);
+    if (idx >= vm.atom_count) return NIL;
+    const name = vm.atoms[idx];
+    var result: Term = NIL;
+    var i: usize = name.len;
+    while (i > 0) {
+        i -= 1;
+        const cell = proc.heap_alloc(2);
+        cell[0] = mk_int(@intCast(name[i]));
+        cell[1] = result;
+        result = mk_ptr(TAG_LIST, cell);
+    }
+    return result;
+}
+
+fn bif_list_to_atom(vm: *VM, _: *Process, args: []Term) Term {
+    var buf: [256]u8 = undefined;
+    var len: usize = 0;
+    var lst = args[0];
+    while (tag_of(lst) == TAG_LIST and len < buf.len) {
+        const cell = as_ptr(lst);
+        if (tag_of(cell[0]) == TAG_INT) {
+            buf[len] = @intCast(as_int(cell[0]) & 0xFF);
+            len += 1;
+        }
+        lst = cell[1];
+    }
+    return mk_atom(put_atom(vm, buf[0..len]));
+}
+
+fn bif_integer_to_list(_: *VM, proc: *Process, args: []Term) Term {
+    var val = as_int(args[0]);
+    if (val == 0) {
+        const cell = proc.heap_alloc(2);
+        cell[0] = mk_int('0');
+        cell[1] = NIL;
+        return mk_ptr(TAG_LIST, cell);
+    }
+    var negative = false;
+    if (val < 0) {
+        negative = true;
+        val = -val;
+    }
+    var result: Term = NIL;
+    while (val > 0) {
+        const digit: u8 = @intCast(@rem(val, 10));
+        const cell = proc.heap_alloc(2);
+        cell[0] = mk_int('0' + digit);
+        cell[1] = result;
+        result = mk_ptr(TAG_LIST, cell);
+        val = @divTrunc(val, 10);
+    }
+    if (negative) {
+        const cell = proc.heap_alloc(2);
+        cell[0] = mk_int('-');
+        cell[1] = result;
+        result = mk_ptr(TAG_LIST, cell);
+    }
+    return result;
+}
+
+fn bif_list_to_integer(vm: *VM, _: *Process, args: []Term) Term {
+    var result: i64 = 0;
+    var negative = false;
+    var first = true;
+    var lst = args[0];
+    while (tag_of(lst) == TAG_LIST) {
+        const cell = as_ptr(lst);
+        if (tag_of(cell[0]) == TAG_INT) {
+            const ch = as_int(cell[0]);
+            if (first and ch == '-') {
+                negative = true;
+            } else if (ch >= '0' and ch <= '9') {
+                result = result * 10 + (ch - '0');
+            } else {
+                return mk_atom(vm.atom_badarg);
+            }
+        }
+        lst = cell[1];
+        first = false;
+    }
+    return mk_int(if (negative) -result else result);
+}
+
+fn bif_list_to_tuple(_: *VM, proc: *Process, args: []Term) Term {
+    // Count elements
+    var count: u32 = 0;
+    var lst = args[0];
+    while (tag_of(lst) == TAG_LIST) {
+        count += 1;
+        lst = as_ptr(lst)[1];
+    }
+    const ptr = proc.heap_alloc(count + 1);
+    ptr[0] = mk_int(@intCast(count));
+    lst = args[0];
+    var i: u32 = 1;
+    while (tag_of(lst) == TAG_LIST) {
+        const cell = as_ptr(lst);
+        ptr[i] = cell[0];
+        lst = cell[1];
+        i += 1;
+    }
+    return mk_ptr(TAG_TUPLE, ptr);
+}
+
+fn bif_tuple_to_list(_: *VM, proc: *Process, args: []Term) Term {
+    if (tag_of(args[0]) != TAG_TUPLE) return NIL;
+    const tptr = as_ptr(args[0]);
+    const arity: u32 = @intCast(as_int(tptr[0]));
+    var result: Term = NIL;
+    var i: u32 = arity;
+    while (i > 0) {
+        i -= 1;
+        const cell = proc.heap_alloc(2);
+        cell[0] = tptr[i + 1];
+        cell[1] = result;
+        result = mk_ptr(TAG_LIST, cell);
+    }
+    return result;
+}
+
+fn bif_float_to_list(_: *VM, proc: *Process, args: []Term) Term {
+    const val = if (is_boxed_float(args[0])) as_float(args[0]) else @as(f64, @floatFromInt(as_int(args[0])));
+    var buf: [64]u8 = undefined;
+    const slice = std.fmt.bufPrint(&buf, "{e}", .{val}) catch return NIL;
+    var result: Term = NIL;
+    var i: usize = slice.len;
+    while (i > 0) {
+        i -= 1;
+        const cell = proc.heap_alloc(2);
+        cell[0] = mk_int(@intCast(slice[i]));
+        cell[1] = result;
+        result = mk_ptr(TAG_LIST, cell);
+    }
+    return result;
+}
+
+fn bif_integer_to_binary(_: *VM, proc: *Process, args: []Term) Term {
+    var val = as_int(args[0]);
+    var buf: [32]u8 = undefined;
+    var len: usize = 0;
+    if (val == 0) {
+        buf[0] = '0';
+        len = 1;
+    } else {
+        var negative = false;
+        if (val < 0) {
+            negative = true;
+            val = -val;
+        }
+        while (val > 0 and len < buf.len) {
+            buf[len] = @intCast(@rem(val, 10) + '0');
+            len += 1;
+            val = @divTrunc(val, 10);
+        }
+        if (negative and len < buf.len) {
+            buf[len] = '-';
+            len += 1;
+        }
+        // Reverse
+        var lo: usize = 0;
+        var hi: usize = len - 1;
+        while (lo < hi) {
+            const tmp = buf[lo];
+            buf[lo] = buf[hi];
+            buf[hi] = tmp;
+            lo += 1;
+            hi -= 1;
+        }
+    }
+    return mk_binary(proc, buf[0..len]);
+}
+
+fn bif_atom_to_binary(vm: *VM, proc: *Process, args: []Term) Term {
+    if (tag_of(args[0]) != TAG_ATOM) return mk_atom(vm.atom_badarg);
+    const idx = as_atom(args[0]);
+    if (idx >= vm.atom_count) return NIL;
+    const name = vm.atoms[idx];
+    return mk_binary(proc, name);
+}
+
+fn bif_max(vm: *VM, _: *Process, args: []Term) Term {
+    _ = vm;
+    return if (term_compare(args[0], args[1]) >= 0) args[0] else args[1];
+}
+
+fn bif_min(vm: *VM, _: *Process, args: []Term) Term {
+    _ = vm;
+    return if (term_compare(args[0], args[1]) <= 0) args[0] else args[1];
+}
+
+fn bif_not(vm: *VM, _: *Process, args: []Term) Term {
+    if (tag_of(args[0]) == TAG_ATOM) {
+        if (as_atom(args[0]) == vm.atom_true) return mk_atom(vm.atom_false);
+        if (as_atom(args[0]) == vm.atom_false) return mk_atom(vm.atom_true);
+    }
+    return mk_atom(vm.atom_badarg);
+}
+
+fn bif_and(vm: *VM, _: *Process, args: []Term) Term {
+    const a = tag_of(args[0]) == TAG_ATOM and as_atom(args[0]) == vm.atom_true;
+    const b = tag_of(args[1]) == TAG_ATOM and as_atom(args[1]) == vm.atom_true;
+    return mk_atom(if (a and b) vm.atom_true else vm.atom_false);
+}
+
+fn bif_or(vm: *VM, _: *Process, args: []Term) Term {
+    const a = tag_of(args[0]) == TAG_ATOM and as_atom(args[0]) == vm.atom_true;
+    const b = tag_of(args[1]) == TAG_ATOM and as_atom(args[1]) == vm.atom_true;
+    return mk_atom(if (a or b) vm.atom_true else vm.atom_false);
+}
+
+fn bif_band(_: *VM, _: *Process, args: []Term) Term {
+    return mk_int(as_int(args[0]) & as_int(args[1]));
+}
+fn bif_bor(_: *VM, _: *Process, args: []Term) Term {
+    return mk_int(as_int(args[0]) | as_int(args[1]));
+}
+fn bif_bxor(_: *VM, _: *Process, args: []Term) Term {
+    return mk_int(as_int(args[0]) ^ as_int(args[1]));
+}
+fn bif_bnot(_: *VM, _: *Process, args: []Term) Term {
+    return mk_int(~as_int(args[0]));
+}
+fn bif_bsl(_: *VM, _: *Process, args: []Term) Term {
+    const shift: u6 = @intCast(as_int(args[1]) & 63);
+    return mk_int(as_int(args[0]) << shift);
+}
+fn bif_bsr(_: *VM, _: *Process, args: []Term) Term {
+    const shift: u6 = @intCast(as_int(args[1]) & 63);
+    return mk_int(as_int(args[0]) >> shift);
+}
+fn bif_negate(_: *VM, proc: *Process, args: []Term) Term {
+    if (is_boxed_float(args[0])) return mk_float(proc, -as_float(args[0]));
+    return mk_int(-as_int(args[0]));
+}
+
+fn bif_append(_: *VM, proc: *Process, args: []Term) Term {
+    // erlang:'++'/2 — concatenate lists
+    if (args[0] == NIL) return args[1];
+    // Copy first list, then append second
+    var result = args[1];
+    // First, collect elements of first list
+    var elems: [4096]Term = undefined;
+    var count: usize = 0;
+    var lst = args[0];
+    while (tag_of(lst) == TAG_LIST and count < 4096) {
+        elems[count] = as_ptr(lst)[0];
+        lst = as_ptr(lst)[1];
+        count += 1;
+    }
+    // Build from back
+    var i: usize = count;
+    while (i > 0) {
+        i -= 1;
+        const cell = proc.heap_alloc(2);
+        cell[0] = elems[i];
+        cell[1] = result;
+        result = mk_ptr(TAG_LIST, cell);
+    }
+    return result;
+}
+
+fn bif_subtract(_: *VM, proc: *Process, args: []Term) Term {
+    // erlang:'--'/2 — list subtraction
+    // For each element in list B, remove first occurrence from list A
+    // Collect list A
+    var a_elems: [4096]Term = undefined;
+    var a_count: usize = 0;
+    var lst = args[0];
+    while (tag_of(lst) == TAG_LIST and a_count < 4096) {
+        a_elems[a_count] = as_ptr(lst)[0];
+        lst = as_ptr(lst)[1];
+        a_count += 1;
+    }
+    // Mark removals
+    var removed = [_]bool{false} ** 4096;
+    lst = args[1];
+    while (tag_of(lst) == TAG_LIST) {
+        const val = as_ptr(lst)[0];
+        for (0..a_count) |i| {
+            if (!removed[i] and term_eq(a_elems[i], val)) {
+                removed[i] = true;
+                break;
+            }
+        }
+        lst = as_ptr(lst)[1];
+    }
+    // Build result
+    var result: Term = NIL;
+    var i: usize = a_count;
+    while (i > 0) {
+        i -= 1;
+        if (!removed[i]) {
+            const cell = proc.heap_alloc(2);
+            cell[0] = a_elems[i];
+            cell[1] = result;
+            result = mk_ptr(TAG_LIST, cell);
+        }
+    }
+    return result;
+}
+
+fn bif_is_float(vm: *VM, _: *Process, args: []Term) Term {
+    return mk_atom(if (is_boxed_float(args[0])) vm.atom_true else vm.atom_false);
+}
+fn bif_is_binary_bif(vm: *VM, _: *Process, args: []Term) Term {
+    return mk_atom(if (is_boxed_binary(args[0])) vm.atom_true else vm.atom_false);
+}
+fn bif_is_number(vm: *VM, _: *Process, args: []Term) Term {
+    return mk_atom(if (is_number(args[0])) vm.atom_true else vm.atom_false);
+}
+fn bif_is_pid(vm: *VM, _: *Process, args: []Term) Term {
+    return mk_atom(if (tag_of(args[0]) == TAG_PID) vm.atom_true else vm.atom_false);
+}
+fn bif_is_function(vm: *VM, _: *Process, args: []Term) Term {
+    return mk_atom(if (is_boxed_fun(args[0])) vm.atom_true else vm.atom_false);
+}
+fn bif_is_map(vm: *VM, _: *Process, args: []Term) Term {
+    return mk_atom(if (is_boxed_map(args[0])) vm.atom_true else vm.atom_false);
+}
+fn bif_map_size(_: *VM, _: *Process, args: []Term) Term {
+    if (is_boxed_map(args[0])) {
+        const ptr = as_ptr(args[0]);
+        return mk_int(@intCast(ptr[1]));
+    }
+    return mk_int(0);
+}
+fn bif_byte_size(_: *VM, _: *Process, args: []Term) Term {
+    if (is_boxed_binary(args[0])) {
+        const ptr = as_ptr(args[0]);
+        return mk_int(@intCast(ptr[1]));
+    }
+    return mk_int(0);
+}
+fn bif_bit_size(_: *VM, _: *Process, args: []Term) Term {
+    if (is_boxed_binary(args[0])) {
+        const ptr = as_ptr(args[0]);
+        return mk_int(@as(i64, @intCast(ptr[1])) * 8);
+    }
+    return mk_int(0);
+}
+
+fn bif_setelement(_: *VM, proc: *Process, args: []Term) Term {
+    const idx: u32 = @intCast(as_int(args[0]));
+    if (tag_of(args[1]) != TAG_TUPLE) return args[1];
+    const tptr = as_ptr(args[1]);
+    const arity: u32 = @intCast(as_int(tptr[0]));
+    const mem = proc.heap_alloc(arity + 1);
+    for (0..arity + 1) |i| {
+        mem[i] = tptr[i];
+    }
+    if (idx >= 1 and idx <= arity) {
+        mem[idx] = args[2];
+    }
+    return mk_ptr(TAG_TUPLE, mem);
+}
+
+fn bif_node(vm: *VM, _: *Process, _: []Term) Term {
+    return mk_atom(vm.atom_nonode_at_nohost);
+}
+
+fn bif_put(vm: *VM, proc: *Process, args: []Term) Term {
+    // Look for existing key
+    for (0..proc.pdict_count) |i| {
+        if (term_eq(proc.pdict_keys[i], args[0])) {
+            const old = proc.pdict_vals[i];
+            proc.pdict_vals[i] = args[1];
+            return old;
+        }
+    }
+    // New key
+    if (proc.pdict_count < 64) {
+        proc.pdict_keys[proc.pdict_count] = args[0];
+        proc.pdict_vals[proc.pdict_count] = args[1];
+        proc.pdict_count += 1;
+    }
+    return mk_atom(vm.atom_undefined);
+}
+
+fn bif_get(vm: *VM, proc: *Process, args: []Term) Term {
+    for (0..proc.pdict_count) |i| {
+        if (term_eq(proc.pdict_keys[i], args[0])) {
+            return proc.pdict_vals[i];
+        }
+    }
+    return mk_atom(vm.atom_undefined);
+}
+
+fn bif_process_flag(vm: *VM, _: *Process, _: []Term) Term {
+    // Stub: ignore trap_exit, etc.
+    return mk_atom(vm.atom_false);
+}
+
+fn bif_register(vm: *VM, _: *Process, args: []Term) Term {
+    if (tag_of(args[0]) == TAG_ATOM and tag_of(args[1]) == TAG_PID) {
+        const name = as_atom(args[0]);
+        const pid = as_pid(args[1]);
+        if (vm.reg_count < 256) {
+            vm.reg_names[vm.reg_count] = name;
+            vm.reg_pids[vm.reg_count] = pid;
+            vm.reg_count += 1;
+        }
+    }
+    return mk_atom(vm.atom_true);
+}
+
+fn bif_whereis(vm: *VM, _: *Process, args: []Term) Term {
+    if (tag_of(args[0]) == TAG_ATOM) {
+        const name = as_atom(args[0]);
+        for (0..vm.reg_count) |i| {
+            if (vm.reg_names[i] == name) return mk_pid(vm.reg_pids[i]);
+        }
+    }
+    return mk_atom(vm.atom_undefined);
+}
+
+fn bif_monitor_stub(vm: *VM, _: *Process, _: []Term) Term {
+    // Stub: return a fake reference (just an atom)
+    return mk_atom(put_atom(vm, "ref"));
+}
+
+fn bif_demonitor_stub(vm: *VM, _: *Process, _: []Term) Term {
+    return mk_atom(vm.atom_true);
+}
+
+fn bif_link_stub(vm: *VM, _: *Process, _: []Term) Term {
+    return mk_atom(vm.atom_true);
+}
+
+fn bif_unlink_stub(vm: *VM, _: *Process, _: []Term) Term {
+    return mk_atom(vm.atom_true);
+}
+
+fn bif_exit_stub(vm: *VM, _: *Process, _: []Term) Term {
+    return mk_atom(vm.atom_true);
+}
+
+fn bif_apply(vm: *VM, _: *Process, args: []Term) Term {
+    // Stub for erlang:apply/3 - we can't easily call into beam code from here
+    // This is a simplified version that returns badarg
+    _ = args;
+    return mk_atom(vm.atom_badarg);
+}
+
+fn bif_lists_reverse(_: *VM, proc: *Process, args: []Term) Term {
+    var result: Term = NIL;
+    var lst = args[0];
+    while (tag_of(lst) == TAG_LIST) {
+        const cell = as_ptr(lst);
+        const new_cell = proc.heap_alloc(2);
+        new_cell[0] = cell[0];
+        new_cell[1] = result;
+        result = mk_ptr(TAG_LIST, new_cell);
+        lst = cell[1];
+    }
+    return result;
+}
+
+fn bif_lists_reverse2(_: *VM, proc: *Process, args: []Term) Term {
+    var result = args[1]; // tail/accumulator
+    var lst = args[0];
+    while (tag_of(lst) == TAG_LIST) {
+        const cell = as_ptr(lst);
+        const new_cell = proc.heap_alloc(2);
+        new_cell[0] = cell[0];
+        new_cell[1] = result;
+        result = mk_ptr(TAG_LIST, new_cell);
+        lst = cell[1];
+    }
+    return result;
+}
+
+fn bif_lists_member(vm: *VM, _: *Process, args: []Term) Term {
+    const val = args[0];
+    var lst = args[1];
+    while (tag_of(lst) == TAG_LIST) {
+        const cell = as_ptr(lst);
+        if (term_eq(val, cell[0])) return mk_atom(vm.atom_true);
+        lst = cell[1];
+    }
+    return mk_atom(vm.atom_false);
+}
+
+fn bif_lists_keyfind(vm: *VM, _: *Process, args: []Term) Term {
+    const key = args[0];
+    const pos: u32 = @intCast(as_int(args[1]));
+    var lst = args[2];
+    while (tag_of(lst) == TAG_LIST) {
+        const cell = as_ptr(lst);
+        const elem = cell[0];
+        if (tag_of(elem) == TAG_TUPLE) {
+            const tptr = as_ptr(elem);
+            const arity: u32 = @intCast(as_int(tptr[0]));
+            if (pos >= 1 and pos <= arity) {
+                if (term_eq(tptr[pos], key)) return elem;
+            }
+        }
+        lst = cell[1];
+    }
+    return mk_atom(vm.atom_false);
+}
+
+fn bif_lists_keymember(vm: *VM, _: *Process, args: []Term) Term {
+    const key = args[0];
+    const pos: u32 = @intCast(as_int(args[1]));
+    var lst = args[2];
+    while (tag_of(lst) == TAG_LIST) {
+        const cell = as_ptr(lst);
+        const elem = cell[0];
+        if (tag_of(elem) == TAG_TUPLE) {
+            const tptr = as_ptr(elem);
+            const arity: u32 = @intCast(as_int(tptr[0]));
+            if (pos >= 1 and pos <= arity and term_eq(tptr[pos], key))
+                return mk_atom(vm.atom_true);
+        }
+        lst = cell[1];
+    }
+    return mk_atom(vm.atom_false);
+}
+
+fn bif_lists_keysearch(vm: *VM, proc: *Process, args: []Term) Term {
+    const key = args[0];
+    const pos: u32 = @intCast(as_int(args[1]));
+    var lst = args[2];
+    while (tag_of(lst) == TAG_LIST) {
+        const cell = as_ptr(lst);
+        const elem = cell[0];
+        if (tag_of(elem) == TAG_TUPLE) {
+            const tptr = as_ptr(elem);
+            const arity: u32 = @intCast(as_int(tptr[0]));
+            if (pos >= 1 and pos <= arity and term_eq(tptr[pos], key)) {
+                // Return {value, Tuple}
+                const tup = proc.heap_alloc(3);
+                tup[0] = mk_int(2);
+                tup[1] = mk_atom(put_atom(vm, "value"));
+                tup[2] = elem;
+                return mk_ptr(TAG_TUPLE, tup);
+            }
+        }
+        lst = cell[1];
+    }
+    return mk_atom(vm.atom_false);
+}
+
+// ============================================================================
+// Section 9c: Maps BIF Implementations
+// ============================================================================
+
+// erlang:map_get/2 — same as maps:get but args are (Key, Map)
+fn bif_map_get(vm: *VM, _: *Process, args: []Term) Term {
+    if (!is_boxed_map(args[1])) return mk_atom(vm.atom_badarg);
+    const ptr = as_ptr(args[1]);
+    const size: u32 = @intCast(ptr[1]);
+    for (0..size) |i| {
+        if (term_eq(args[0], ptr[2 + i * 2])) return ptr[2 + i * 2 + 1];
+    }
+    return mk_atom(vm.atom_badarg);
+}
+
+// erlang:is_map_key/2
+fn bif_is_map_key(vm: *VM, _: *Process, args: []Term) Term {
+    if (!is_boxed_map(args[1])) return mk_atom(vm.atom_false);
+    const ptr = as_ptr(args[1]);
+    const size: u32 = @intCast(ptr[1]);
+    for (0..size) |i| {
+        if (term_eq(args[0], ptr[2 + i * 2])) return mk_atom(vm.atom_true);
+    }
+    return mk_atom(vm.atom_false);
+}
+
+fn bif_maps_get(vm: *VM, _: *Process, args: []Term) Term {
+    if (!is_boxed_map(args[1])) return mk_atom(vm.atom_badarg);
+    const ptr = as_ptr(args[1]);
+    const size: u32 = @intCast(ptr[1]);
+    for (0..size) |i| {
+        if (term_eq(args[0], ptr[2 + i * 2])) return ptr[2 + i * 2 + 1];
+    }
+    return mk_atom(vm.atom_badarg);
+}
+
+fn bif_maps_find(vm: *VM, proc: *Process, args: []Term) Term {
+    if (!is_boxed_map(args[1])) return mk_atom(vm.atom_error);
+    const ptr = as_ptr(args[1]);
+    const size: u32 = @intCast(ptr[1]);
+    for (0..size) |i| {
+        if (term_eq(args[0], ptr[2 + i * 2])) {
+            const tup = proc.heap_alloc(3);
+            tup[0] = mk_int(2);
+            tup[1] = mk_atom(vm.atom_ok);
+            tup[2] = ptr[2 + i * 2 + 1];
+            return mk_ptr(TAG_TUPLE, tup);
+        }
+    }
+    return mk_atom(vm.atom_error);
+}
+
+fn bif_maps_put(_: *VM, proc: *Process, args: []Term) Term {
+    // maps:put(Key, Value, Map) -> Map
+    if (!is_boxed_map(args[2])) {
+        // Create new map with single entry
+        const mem = proc.heap_alloc(4);
+        mem[0] = BOXED_MAP;
+        mem[1] = 1;
+        mem[2] = args[0];
+        mem[3] = args[1];
+        return mk_ptr(TAG_BOXED, mem);
+    }
+    const old_ptr = as_ptr(args[2]);
+    const old_size: u32 = @intCast(old_ptr[1]);
+    // Check if key exists
+    var key_idx: ?u32 = null;
+    for (0..old_size) |i| {
+        if (term_eq(args[0], old_ptr[2 + i * 2])) {
+            key_idx = @intCast(i);
+            break;
+        }
+    }
+    if (key_idx) |ki| {
+        // Update existing key
+        const mem = proc.heap_alloc(2 + old_size * 2);
+        mem[0] = BOXED_MAP;
+        mem[1] = @intCast(old_size);
+        for (0..old_size) |i| {
+            mem[2 + i * 2] = old_ptr[2 + i * 2];
+            mem[2 + i * 2 + 1] = old_ptr[2 + i * 2 + 1];
+        }
+        mem[2 + ki * 2 + 1] = args[1];
+        return mk_ptr(TAG_BOXED, mem);
+    } else {
+        // Add new key
+        const new_size = old_size + 1;
+        const mem = proc.heap_alloc(2 + new_size * 2);
+        mem[0] = BOXED_MAP;
+        mem[1] = @intCast(new_size);
+        for (0..old_size) |i| {
+            mem[2 + i * 2] = old_ptr[2 + i * 2];
+            mem[2 + i * 2 + 1] = old_ptr[2 + i * 2 + 1];
+        }
+        mem[2 + old_size * 2] = args[0];
+        mem[2 + old_size * 2 + 1] = args[1];
+        return mk_ptr(TAG_BOXED, mem);
+    }
+}
+
+fn bif_maps_is_key(vm: *VM, _: *Process, args: []Term) Term {
+    if (!is_boxed_map(args[1])) return mk_atom(vm.atom_false);
+    const ptr = as_ptr(args[1]);
+    const size: u32 = @intCast(ptr[1]);
+    for (0..size) |i| {
+        if (term_eq(args[0], ptr[2 + i * 2])) return mk_atom(vm.atom_true);
+    }
+    return mk_atom(vm.atom_false);
+}
+
+fn bif_maps_keys(_: *VM, proc: *Process, args: []Term) Term {
+    if (!is_boxed_map(args[0])) return NIL;
+    const ptr = as_ptr(args[0]);
+    const size: u32 = @intCast(ptr[1]);
+    var result: Term = NIL;
+    var i: u32 = size;
+    while (i > 0) {
+        i -= 1;
+        const cell = proc.heap_alloc(2);
+        cell[0] = ptr[2 + i * 2];
+        cell[1] = result;
+        result = mk_ptr(TAG_LIST, cell);
+    }
+    return result;
+}
+
+fn bif_maps_values(_: *VM, proc: *Process, args: []Term) Term {
+    if (!is_boxed_map(args[0])) return NIL;
+    const ptr = as_ptr(args[0]);
+    const size: u32 = @intCast(ptr[1]);
+    var result: Term = NIL;
+    var i: u32 = size;
+    while (i > 0) {
+        i -= 1;
+        const cell = proc.heap_alloc(2);
+        cell[0] = ptr[2 + i * 2 + 1];
+        cell[1] = result;
+        result = mk_ptr(TAG_LIST, cell);
+    }
+    return result;
+}
+
+fn bif_maps_size(_: *VM, _: *Process, args: []Term) Term {
+    if (!is_boxed_map(args[0])) return mk_int(0);
+    const ptr = as_ptr(args[0]);
+    return mk_int(@intCast(ptr[1]));
+}
+
+fn bif_maps_to_list(_: *VM, proc: *Process, args: []Term) Term {
+    if (!is_boxed_map(args[0])) return NIL;
+    const ptr = as_ptr(args[0]);
+    const size: u32 = @intCast(ptr[1]);
+    var result: Term = NIL;
+    var i: u32 = size;
+    while (i > 0) {
+        i -= 1;
+        // Create {Key, Value} tuple
+        const tup = proc.heap_alloc(3);
+        tup[0] = mk_int(2);
+        tup[1] = ptr[2 + i * 2];
+        tup[2] = ptr[2 + i * 2 + 1];
+        const cell = proc.heap_alloc(2);
+        cell[0] = mk_ptr(TAG_TUPLE, tup);
+        cell[1] = result;
+        result = mk_ptr(TAG_LIST, cell);
+    }
+    return result;
+}
+
+fn bif_maps_from_list(_: *VM, proc: *Process, args: []Term) Term {
+    // Count pairs
+    var count: u32 = 0;
+    var lst = args[0];
+    while (tag_of(lst) == TAG_LIST) {
+        count += 1;
+        lst = as_ptr(lst)[1];
+    }
+    const mem = proc.heap_alloc(2 + count * 2);
+    mem[0] = BOXED_MAP;
+    mem[1] = @intCast(count);
+    lst = args[0];
+    var i: u32 = 0;
+    while (tag_of(lst) == TAG_LIST) {
+        const cell = as_ptr(lst);
+        const pair = cell[0];
+        if (tag_of(pair) == TAG_TUPLE) {
+            const tptr = as_ptr(pair);
+            mem[2 + i * 2] = tptr[1]; // key
+            mem[2 + i * 2 + 1] = tptr[2]; // value
+        }
+        lst = cell[1];
+        i += 1;
+    }
+    return mk_ptr(TAG_BOXED, mem);
+}
+
+fn bif_maps_remove(_: *VM, proc: *Process, args: []Term) Term {
+    if (!is_boxed_map(args[1])) return args[1];
+    const ptr = as_ptr(args[1]);
+    const size: u32 = @intCast(ptr[1]);
+    // Find key
+    var remove_idx: ?u32 = null;
+    for (0..size) |i| {
+        if (term_eq(args[0], ptr[2 + i * 2])) {
+            remove_idx = @intCast(i);
+            break;
+        }
+    }
+    if (remove_idx == null) return args[1]; // Key not found, return original
+    const ri = remove_idx.?;
+    const new_size = size - 1;
+    const mem = proc.heap_alloc(2 + new_size * 2);
+    mem[0] = BOXED_MAP;
+    mem[1] = @intCast(new_size);
+    var j: u32 = 0;
+    for (0..size) |i| {
+        if (i != ri) {
+            mem[2 + j * 2] = ptr[2 + i * 2];
+            mem[2 + j * 2 + 1] = ptr[2 + i * 2 + 1];
+            j += 1;
+        }
+    }
+    return mk_ptr(TAG_BOXED, mem);
+}
+
+fn bif_maps_merge(_: *VM, proc: *Process, args: []Term) Term {
+    if (!is_boxed_map(args[0]) or !is_boxed_map(args[1])) return args[0];
+    const ptr1 = as_ptr(args[0]);
+    const ptr2 = as_ptr(args[1]);
+    const size1: u32 = @intCast(ptr1[1]);
+    const size2: u32 = @intCast(ptr2[1]);
+    // Start with map1, add/update from map2
+    // Max size is size1 + size2
+    const max_size = size1 + size2;
+    const mem = proc.heap_alloc(2 + max_size * 2);
+    mem[0] = BOXED_MAP;
+    // Copy map1
+    for (0..size1) |i| {
+        mem[2 + i * 2] = ptr1[2 + i * 2];
+        mem[2 + i * 2 + 1] = ptr1[2 + i * 2 + 1];
+    }
+    var actual_size = size1;
+    // Merge map2
+    for (0..size2) |i| {
+        const key = ptr2[2 + i * 2];
+        const val = ptr2[2 + i * 2 + 1];
+        var found = false;
+        for (0..actual_size) |j| {
+            if (term_eq(key, mem[2 + j * 2])) {
+                mem[2 + j * 2 + 1] = val;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            mem[2 + actual_size * 2] = key;
+            mem[2 + actual_size * 2 + 1] = val;
+            actual_size += 1;
+        }
+    }
+    mem[1] = @intCast(actual_size);
+    return mk_ptr(TAG_BOXED, mem);
+}
+
+fn bif_math_sqrt(_: *VM, proc: *Process, args: []Term) Term {
+    const val = as_number_f64(args[0]);
+    return mk_float(proc, @sqrt(val));
+}
+
+fn bif_characters_to_list(_: *VM, _: *Process, args: []Term) Term {
+    // Simple stub: if it's already a list, return it
+    return args[0];
+}
+
 fn term_eq(a: Term, b: Term) bool {
     if (a == b) return true;
     const ta = tag_of(a);
     const tb = tag_of(b);
-    if (ta != tb) return false;
+    if (ta != tb) {
+        // Float/int mixed comparison
+        if ((ta == TAG_INT and is_boxed_float(b)) or (is_boxed_float(a) and tb == TAG_INT)) {
+            const fa: f64 = if (ta == TAG_INT) @floatFromInt(as_int(a)) else as_float(a);
+            const fb: f64 = if (tb == TAG_INT) @floatFromInt(as_int(b)) else as_float(b);
+            return fa == fb;
+        }
+        return false;
+    }
     if (ta == TAG_TUPLE) {
         const pa = as_ptr(a);
         const pb = as_ptr(b);
@@ -1185,17 +2276,54 @@ fn term_eq(a: Term, b: Term) bool {
         const pb = as_ptr(b);
         return term_eq(pa[0], pb[0]) and term_eq(pa[1], pb[1]);
     }
+    if (ta == TAG_BOXED) {
+        const pa = as_ptr(a);
+        const pb = as_ptr(b);
+        if (pa[0] != pb[0]) return false; // Different boxed types
+        if (pa[0] == BOXED_FLOAT) {
+            return as_float(a) == as_float(b);
+        }
+        if (pa[0] == BOXED_BINARY) {
+            const sa = as_binary_slice(a);
+            const sb = as_binary_slice(b);
+            return std.mem.eql(u8, sa, sb);
+        }
+        if (pa[0] == BOXED_MAP) {
+            // Maps are equal if they have the same key-value pairs
+            const size_a: u32 = @intCast(pa[1]);
+            const size_b: u32 = @intCast(pb[1]);
+            if (size_a != size_b) return false;
+            // Check all keys in a exist in b with equal values
+            for (0..size_a) |i| {
+                const key = pa[2 + i * 2];
+                const val_a = pa[2 + i * 2 + 1];
+                var found = false;
+                for (0..size_b) |j| {
+                    if (term_eq(key, pb[2 + j * 2])) {
+                        if (!term_eq(val_a, pb[2 + j * 2 + 1])) return false;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) return false;
+            }
+            return true;
+        }
+    }
     return false;
 }
 
 fn term_compare(a: Term, b: Term) i64 {
     const ta = tag_of(a);
     const tb = tag_of(b);
-    if (ta == TAG_INT and tb == TAG_INT) {
-        const va = as_int(a);
-        const vb = as_int(b);
-        if (va < vb) return -1;
-        if (va > vb) return 1;
+    // Numeric comparison (int vs int, float vs float, int vs float)
+    const a_is_num = (ta == TAG_INT) or is_boxed_float(a);
+    const b_is_num = (tb == TAG_INT) or is_boxed_float(b);
+    if (a_is_num and b_is_num) {
+        const fa: f64 = if (ta == TAG_INT) @floatFromInt(as_int(a)) else as_float(a);
+        const fb: f64 = if (tb == TAG_INT) @floatFromInt(as_int(b)) else as_float(b);
+        if (fa < fb) return -1;
+        if (fa > fb) return 1;
         return 0;
     }
     if (ta == TAG_ATOM and tb == TAG_ATOM) {
@@ -1212,7 +2340,18 @@ fn term_compare(a: Term, b: Term) i64 {
 
 fn type_order(t: Term) u8 {
     if (t == NIL) return 8;
-    return switch (tag_of(t)) {
+    const tag = tag_of(t);
+    if (tag == TAG_BOXED) {
+        const ptr = as_ptr(t);
+        return switch (ptr[0]) {
+            BOXED_FLOAT => 0, // number
+            BOXED_FUN => 3, // fun
+            BOXED_MAP => 7, // map
+            BOXED_BINARY => 10, // bitstring
+            else => 10,
+        };
+    }
+    return switch (tag) {
         TAG_INT => 0,
         TAG_ATOM => 1,
         TAG_PID => 5,
@@ -1542,7 +2681,12 @@ fn execute(vm: *VM, proc_idx: u32) !void {
                 const fail = decode_arg(code, &p.pc);
                 const src = decode_arg(code, &p.pc);
                 const val = read_src(vm, p, mod, src);
-                const ok = if (op == 45) tag_of(val) == TAG_INT else false;
+                const ok = switch (op) {
+                    45 => tag_of(val) == TAG_INT,
+                    46 => is_boxed_float(val),
+                    47 => tag_of(val) == TAG_INT or is_boxed_float(val),
+                    else => false,
+                };
                 if (!ok) p.pc = mod.labels[@intCast(fail.val)];
             },
             48 => { // is_atom Fail Src
@@ -1560,10 +2704,18 @@ fn execute(vm: *VM, proc_idx: u32) !void {
                     p.pc = mod.labels[@intCast(fail.val)];
                 }
             },
-            50, 51, 53 => { // is_ref, is_port, is_binary — always fail
+            50, 51 => { // is_ref, is_port — always fail
                 const fail = decode_arg(code, &p.pc);
                 _ = decode_arg(code, &p.pc);
                 p.pc = mod.labels[@intCast(fail.val)];
+            },
+            53 => { // is_binary Fail Src
+                const fail = decode_arg(code, &p.pc);
+                const src = decode_arg(code, &p.pc);
+                const val = read_src(vm, p, mod, src);
+                if (!is_boxed_binary(val)) {
+                    p.pc = mod.labels[@intCast(fail.val)];
+                }
             },
             52 => { // is_nil Fail Src
                 const fail = decode_arg(code, &p.pc);
@@ -1728,9 +2880,11 @@ fn execute(vm: *VM, proc_idx: u32) !void {
             },
             77 => { // is_function Fail Src
                 const fail = decode_arg(code, &p.pc);
-                _ = decode_arg(code, &p.pc);
-                // We don't support lambda checks properly yet, fail
-                p.pc = mod.labels[@intCast(fail.val)];
+                const src = decode_arg(code, &p.pc);
+                const val = read_src(vm, p, mod, src);
+                if (!is_boxed_fun(val)) {
+                    p.pc = mod.labels[@intCast(fail.val)];
+                }
             },
             78 => { // call_ext_only Arity Import
                 const arity_arg = decode_arg(code, &p.pc);
@@ -1767,9 +2921,18 @@ fn execute(vm: *VM, proc_idx: u32) !void {
             },
             114 => { // is_function2 Fail Src Arity
                 const fail = decode_arg(code, &p.pc);
-                _ = decode_arg(code, &p.pc);
-                _ = decode_arg(code, &p.pc);
-                p.pc = mod.labels[@intCast(fail.val)];
+                const src = decode_arg(code, &p.pc);
+                const arity = decode_arg(code, &p.pc);
+                const val = read_src(vm, p, mod, src);
+                if (is_boxed_fun(val)) {
+                    const fptr = as_ptr(val);
+                    const fun_arity = as_int(fptr[3]);
+                    if (fun_arity != arity.val) {
+                        p.pc = mod.labels[@intCast(fail.val)];
+                    }
+                } else {
+                    p.pc = mod.labels[@intCast(fail.val)];
+                }
             },
             124 => { // gc_bif1 Fail Live Import Arg1 Dst
                 const fail = decode_arg(code, &p.pc);
@@ -1810,16 +2973,11 @@ fn execute(vm: *VM, proc_idx: u32) !void {
                 }
                 p.pc = mod.labels[@intCast(fail.val)];
             },
-            136 => { // trim N
+            136 => { // trim N Remaining
                 const n_arg = decode_arg(code, &p.pc);
+                _ = decode_arg(code, &p.pc); // Remaining (unused)
                 const n: u32 = @intCast(n_arg.val);
-                // Move CP up, removing N slots
                 if (n > 0) {
-                    // The stack layout is: [y0..yN-1 | remaining | CP]
-                    // Trim removes the first N y-regs
-                    // Actually, trim removes the bottom N slots before CP
-                    // Stack: sp → [y0] [y1] ... [yK-1] [CP]
-                    // After trim N: sp → [yN] [yN+1] ... [yK-1] [CP]
                     p.sp += n;
                 }
             },
@@ -1841,6 +2999,146 @@ fn execute(vm: *VM, proc_idx: u32) !void {
             },
             153 => { // line
                 _ = decode_arg(code, &p.pc);
+            },
+            154, 155 => { // put_map_assoc / put_map_exact: Fail Src Dst Live Pairs
+                const fail = decode_arg(code, &p.pc);
+                const src_arg = decode_arg(code, &p.pc);
+                const dst = decode_arg(code, &p.pc);
+                const live = decode_arg(code, &p.pc);
+                const pairs = decode_arg(code, &p.pc);
+                _ = fail;
+                _ = live;
+                const src_val = read_src(vm, p, mod, src_arg);
+                const pair_count: u32 = @intCast(@divExact(@as(u32, @intCast(pairs.val)), 2));
+                // Read pairs from ext_list
+                var keys: [64]Term = undefined;
+                var vals: [64]Term = undefined;
+                var pair_pc = pairs.extra;
+                for (0..pair_count) |i| {
+                    const k = decode_arg(code, &pair_pc);
+                    const v = decode_arg(code, &pair_pc);
+                    keys[i] = read_src(vm, p, mod, k);
+                    vals[i] = read_src(vm, p, mod, v);
+                }
+                p.pc = pair_pc; // Advance past the ext_list
+                // Get existing map entries
+                var old_size: u32 = 0;
+                var old_ptr: [*]Term = undefined;
+                if (is_boxed_map(src_val)) {
+                    old_ptr = as_ptr(src_val);
+                    old_size = @intCast(old_ptr[1]);
+                }
+                // Build new map: start with old entries, add/update new ones
+                const max_new_size = old_size + pair_count;
+                const mem = p.heap_alloc(2 + max_new_size * 2);
+                mem[0] = BOXED_MAP;
+                // Copy old entries
+                for (0..old_size) |i| {
+                    mem[2 + i * 2] = old_ptr[2 + i * 2];
+                    mem[2 + i * 2 + 1] = old_ptr[2 + i * 2 + 1];
+                }
+                var new_size = old_size;
+                // Add/update new entries
+                for (0..pair_count) |i| {
+                    var found = false;
+                    for (0..new_size) |j| {
+                        if (term_eq(keys[i], mem[2 + j * 2])) {
+                            mem[2 + j * 2 + 1] = vals[i]; // Update
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        mem[2 + new_size * 2] = keys[i];
+                        mem[2 + new_size * 2 + 1] = vals[i];
+                        new_size += 1;
+                    }
+                }
+                mem[1] = @intCast(new_size);
+                write_dst(p, dst, mk_ptr(TAG_BOXED, mem));
+            },
+            156 => { // is_map Fail Src
+                const fail = decode_arg(code, &p.pc);
+                const src = decode_arg(code, &p.pc);
+                const val = read_src(vm, p, mod, src);
+                if (!is_boxed_map(val)) {
+                    p.pc = mod.labels[@intCast(fail.val)];
+                }
+            },
+            157 => { // has_map_fields Fail Src Fields(ext_list)
+                const fail = decode_arg(code, &p.pc);
+                const src_arg = decode_arg(code, &p.pc);
+                const fields = decode_arg(code, &p.pc);
+                const val = read_src(vm, p, mod, src_arg);
+                const field_count: u32 = @intCast(fields.val);
+                // Skip past ext_list to advance pc
+                var fpc = fields.extra;
+                for (0..field_count) |_| {
+                    _ = decode_arg(code, &fpc);
+                }
+                var ok = is_boxed_map(val);
+                if (ok) {
+                    const map_ptr = as_ptr(val);
+                    const map_size: u32 = @intCast(map_ptr[1]);
+                    var check_pc = fields.extra;
+                    for (0..field_count) |_| {
+                        const field = decode_arg(code, &check_pc);
+                        const field_val = read_src(vm, p, mod, field);
+                        var found = false;
+                        for (0..map_size) |j| {
+                            if (term_eq(field_val, map_ptr[2 + j * 2])) {
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                p.pc = fpc;
+                if (!ok) p.pc = mod.labels[@intCast(fail.val)];
+            },
+            158 => { // get_map_elements Fail Src Pairs(ext_list)
+                const fail = decode_arg(code, &p.pc);
+                const src_arg = decode_arg(code, &p.pc);
+                const pairs = decode_arg(code, &p.pc);
+                const val = read_src(vm, p, mod, src_arg);
+                const pair_count: u32 = @intCast(@divExact(@as(u32, @intCast(pairs.val)), 2));
+                // Skip past ext_list to advance pc
+                var end_pc = pairs.extra;
+                for (0..pair_count) |_| {
+                    _ = decode_arg(code, &end_pc);
+                    _ = decode_arg(code, &end_pc);
+                }
+                if (!is_boxed_map(val)) {
+                    p.pc = mod.labels[@intCast(fail.val)];
+                } else {
+                    const map_ptr = as_ptr(val);
+                    const map_size: u32 = @intCast(map_ptr[1]);
+                    var ok = true;
+                    var pair_pc = pairs.extra;
+                    for (0..pair_count) |_| {
+                        const key_arg = decode_arg(code, &pair_pc);
+                        const dst_arg = decode_arg(code, &pair_pc);
+                        const key = read_src(vm, p, mod, key_arg);
+                        var found = false;
+                        for (0..map_size) |j| {
+                            if (term_eq(key, map_ptr[2 + j * 2])) {
+                                write_dst(p, dst_arg, map_ptr[2 + j * 2 + 1]);
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    p.pc = end_pc;
+                    if (!ok) p.pc = mod.labels[@intCast(fail.val)];
+                }
             },
             159 => { // is_tagged_tuple Fail Src Arity Atom
                 const fail = decode_arg(code, &p.pc);
@@ -1911,15 +3209,16 @@ fn execute(vm: *VM, proc_idx: u32) !void {
                 if (lambda_idx < mod.lambdas.len) {
                     const lam = mod.lambdas[lambda_idx];
                     const nfree = lam.nfree;
-                    const mem = p.heap_alloc(4 + nfree);
-                    mem[0] = mk_int(@intCast(p.mod));
-                    mem[1] = mk_int(@intCast(lam.label));
-                    mem[2] = mk_int(@intCast(lam.arity));
-                    mem[3] = mk_int(@intCast(nfree));
+                    const mem = p.heap_alloc(5 + nfree);
+                    mem[0] = BOXED_FUN;
+                    mem[1] = mk_int(@intCast(p.mod));
+                    mem[2] = mk_int(@intCast(lam.label));
+                    mem[3] = mk_int(@intCast(lam.arity));
+                    mem[4] = mk_int(@intCast(nfree));
                     var fpc2 = free_list.extra;
                     for (0..nfree) |i| {
                         const fv = decode_arg(code, &fpc2);
-                        mem[4 + i] = read_src(vm, p, mod, fv);
+                        mem[5 + i] = read_src(vm, p, mod, fv);
                     }
                     write_dst(p, dst, mk_ptr(TAG_BOXED, mem));
                 }
@@ -1942,13 +3241,14 @@ fn execute(vm: *VM, proc_idx: u32) !void {
                 _ = tag_arg;
                 const fun_val = read_src(vm, p, mod, fun_arg);
                 const arity: u32 = @intCast(arity_arg.val);
-                if (tag_of(fun_val) == TAG_BOXED) {
+                if (is_boxed_fun(fun_val)) {
                     const fptr = as_ptr(fun_val);
-                    const fun_mod: u16 = @intCast(as_int(fptr[0]));
-                    const fun_label: u32 = @intCast(as_int(fptr[1]));
-                    const nfree: u32 = @intCast(as_int(fptr[3]));
+                    // fptr[0] = BOXED_FUN, fptr[1] = mod, fptr[2] = label, fptr[3] = arity, fptr[4] = nfree
+                    const fun_mod: u16 = @intCast(as_int(fptr[1]));
+                    const fun_label: u32 = @intCast(as_int(fptr[2]));
+                    const nfree: u32 = @intCast(as_int(fptr[4]));
                     for (0..nfree) |i| {
-                        p.x[arity + i] = fptr[4 + i];
+                        p.x[arity + i] = fptr[5 + i];
                     }
                     // Save CP
                     p.cp = (@as(u64, p.mod) << 32) | p.pc;
@@ -1957,7 +3257,7 @@ fn execute(vm: *VM, proc_idx: u32) !void {
                 }
                 p.reds -= 1;
             },
-            183 => { // executable_line
+            183, 184 => { // executable_line / debug_line
                 _ = decode_arg(code, &p.pc);
                 _ = decode_arg(code, &p.pc);
             },
@@ -2091,7 +3391,51 @@ fn print_term(vm: *VM, writer: anytype, term: Term) void {
             writer.writeByte('}') catch {};
         },
         TAG_BOXED => {
-            writer.writeAll("#Fun<>") catch {};
+            const ptr = as_ptr(term);
+            if (ptr[0] == BOXED_FLOAT) {
+                const val = as_float(term);
+                // Print float - if it's a whole number, add .0
+                const ival: i64 = @intFromFloat(val);
+                if (@as(f64, @floatFromInt(ival)) == val and @abs(val) < 1.0e15) {
+                    writer.print("{d}.0", .{ival}) catch {};
+                } else {
+                    writer.print("{d}", .{val}) catch {};
+                }
+            } else if (ptr[0] == BOXED_BINARY) {
+                const bytes = as_binary_slice(term);
+                // Check if it's printable ASCII
+                var printable = true;
+                for (bytes) |b| {
+                    if (b < 32 or b > 126) {
+                        printable = false;
+                        break;
+                    }
+                }
+                if (printable and bytes.len > 0) {
+                    writer.writeAll("<<\"") catch {};
+                    writer.writeAll(bytes) catch {};
+                    writer.writeAll("\">>") catch {};
+                } else {
+                    writer.writeAll("<<") catch {};
+                    for (bytes, 0..) |b, i| {
+                        if (i > 0) writer.writeByte(',') catch {};
+                        writer.print("{d}", .{b}) catch {};
+                    }
+                    writer.writeAll(">>") catch {};
+                }
+            } else if (ptr[0] == BOXED_MAP) {
+                const size: u32 = @intCast(ptr[1]);
+                writer.writeAll("#{") catch {};
+                for (0..size) |i| {
+                    if (i > 0) writer.writeByte(',') catch {};
+                    print_term(vm, writer, ptr[2 + i * 2]);
+                    writer.writeAll(" => ") catch {};
+                    print_term(vm, writer, ptr[2 + i * 2 + 1]);
+                }
+                writer.writeByte('}') catch {};
+            } else {
+                writer.writeAll("#Fun<>") catch {};
+            }
         },
         else => {
             writer.print("?({d})", .{term}) catch {};
